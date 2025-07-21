@@ -1,0 +1,549 @@
+from fastapi import APIRouter, HTTPException, status, Depends, Query, File, UploadFile, Form
+from fastapi.responses import FileResponse
+from typing import List, Optional
+from app.models.book import Book, BookCreate, BookUpdate, BookResponse
+from app.models.user import UserResponse
+from app.services.auth_service import get_current_active_user, get_current_admin_user
+from app.database import get_database
+from bson import ObjectId
+from datetime import datetime
+import math
+import os
+import shutil
+import uuid
+from pathlib import Path
+
+router = APIRouter()
+
+@router.get("/", response_model=List[BookResponse])
+async def get_books(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    author: Optional[str] = None,
+    current_user: UserResponse = Depends(get_current_active_user)
+):
+    """R√©cup√©rer la liste des livres avec pagination et filtres"""
+    db = get_database()
+    
+    # Construire le filtre de recherche
+    filter_query = {}
+    
+    if search:
+        filter_query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"author": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}}
+        ]
+    
+    if category:
+        filter_query["category"] = {"$regex": category, "$options": "i"}
+    
+    if author:
+        filter_query["author"] = {"$regex": author, "$options": "i"}
+    
+    # R√©cup√©rer les livres
+    cursor = db.books.find(filter_query).skip(skip).limit(limit).sort("created_at", -1)
+    books = await cursor.to_list(length=limit)
+    
+    # Convertir en r√©ponse
+    book_responses = []
+    for book in books:
+        book_responses.append(BookResponse(
+            id=str(book["_id"]),
+            title=book["title"],
+            author=book["author"],
+            isbn=book["isbn"],
+            description=book.get("description"),
+            category=book["category"],
+            publication_year=book["publication_year"],
+            publisher=book.get("publisher"),
+            pages=book.get("pages"),
+            language=book["language"],
+            cover_image=book.get("cover_image"),
+            available_copies=book["available_copies"],
+            total_copies=book["total_copies"],
+            created_at=book.get("created_at", datetime.utcnow()),
+            rating=book.get("rating", 0.0),
+            reviews_count=book.get("reviews_count", 0)
+        ))
+    
+    return book_responses
+
+@router.get("/{book_id}", response_model=BookResponse)
+async def get_book(
+    book_id: str,
+    current_user: UserResponse = Depends(get_current_active_user)
+):
+    """R√©cup√©rer un livre par son ID"""
+    db = get_database()
+    
+    if not ObjectId.is_valid(book_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid book ID"
+        )
+    
+    book = await db.books.find_one({"_id": ObjectId(book_id)})
+    if not book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Book not found"
+        )
+    
+    return BookResponse(
+        id=str(book["_id"]),
+        title=book["title"],
+        author=book["author"],
+        isbn=book["isbn"],
+        description=book.get("description"),
+        category=book["category"],
+        publication_year=book["publication_year"],
+        publisher=book.get("publisher"),
+        pages=book.get("pages"),
+        language=book["language"],
+        cover_image=book.get("cover_image"),
+        available_copies=book["available_copies"],
+        total_copies=book["total_copies"],
+        created_at=book.get("created_at", datetime.utcnow()),
+        rating=book.get("rating", 0.0),
+        reviews_count=book.get("reviews_count", 0)
+    )
+
+import logging
+logger = logging.getLogger(__name__)
+
+@router.post("/", response_model=BookResponse)
+async def create_book(
+    book_data: BookCreate,
+    current_user: UserResponse = Depends(get_current_admin_user)
+):
+    """Cr√©er un nouveau livre (admin seulement)"""
+    # Log des donn√©es re√ßues pour le d√©bogage
+    try:
+        logger.info(f"DONN√âES LIVRE RE√áUES: {book_data}")
+        # Si BookCreate est un mod√®le Pydantic, convertissons-le en dict pour l'afficher
+        try:
+            # Tentative avec Pydantic v2
+            data_dict = book_data.model_dump()
+        except AttributeError:
+            # Fallback pour Pydantic v1
+            data_dict = book_data.dict()
+        logger.info(f"LIVRE EN DICT: {data_dict}")
+        
+        # V√©rification des types de donn√©es
+        logger.info(f"TYPES DE DONN√âES:")
+        for key, value in data_dict.items():
+            logger.info(f"  - {key}: {type(value).__name__} = {value}")
+    except Exception as e:
+        logger.error(f"ERREUR LORS DU LOGGING: {str(e)}")
+    
+    db = get_database()
+    
+    # V√©rifier si l'ISBN existe d√©j√†
+    existing_book = await db.books.find_one({"isbn": book_data.isbn})
+    if existing_book:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Book with this ISBN already exists"
+        )
+    
+    # Cr√©er le livre
+    book = Book(
+        title=book_data.title,
+        author=book_data.author,
+        isbn=book_data.isbn,
+        description=book_data.description,
+        category=book_data.category,
+        publication_year=book_data.publication_year,
+        publisher=book_data.publisher,
+        pages=book_data.pages,
+        language=book_data.language,
+        cover_image=book_data.cover_image,
+        total_copies=book_data.total_copies,
+        available_copies=book_data.total_copies
+    )
+    
+    # Ins√©rer en base - Support Pydantic v1 et v2
+    try:
+        # Essayer Pydantic v2
+        book_dict = book.model_dump(by_alias=True, exclude_unset=True)
+    except AttributeError:
+        # Fallback pour Pydantic v1
+        book_dict = book.dict(by_alias=True, exclude_unset=True)
+    
+    # Ajouter le champ created_at pour tous les nouveaux livres
+    from datetime import datetime
+    book_dict["created_at"] = datetime.utcnow()
+    
+    # Ajouter des champs par d√©faut pour les ratings et reviews
+    book_dict["rating"] = 0.0
+    book_dict["reviews_count"] = 0
+    
+    logger.info(f"INSERTION LIVRE AVEC: {book_dict}")
+    result = await db.books.insert_one(book_dict)
+    
+    # Retourner le livre cr√©√©
+    created_book = await db.books.find_one({"_id": result.inserted_id})
+    return BookResponse(
+        id=str(created_book["_id"]),
+        title=created_book["title"],
+        author=created_book["author"],
+        isbn=created_book["isbn"],
+        description=created_book.get("description"),
+        category=created_book["category"],
+        publication_year=created_book["publication_year"],
+        publisher=created_book.get("publisher"),
+        pages=created_book.get("pages"),
+        language=created_book["language"],
+        cover_image=created_book.get("cover_image"),
+        available_copies=created_book["available_copies"],
+        total_copies=created_book["total_copies"],
+        created_at=created_book["created_at"],
+        rating=created_book.get("rating", 0.0),
+        reviews_count=created_book.get("reviews_count", 0)
+    )
+
+@router.put("/{book_id}", response_model=BookResponse)
+async def update_book(
+    book_id: str,
+    book_data: BookUpdate,
+    current_user: UserResponse = Depends(get_current_admin_user)
+):
+    """Mettre √† jour un livre (admin seulement)"""
+    db = get_database()
+    
+    if not ObjectId.is_valid(book_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid book ID"
+        )
+    
+    # V√©rifier que le livre existe
+    existing_book = await db.books.find_one({"_id": ObjectId(book_id)})
+    if not existing_book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Book not found"
+        )
+    
+    # Pr√©parer les donn√©es de mise √† jour
+    update_data = book_data.dict(exclude_unset=True)
+    if update_data:
+        update_data["updated_at"] = datetime.utcnow()
+        
+        # Mettre √† jour
+        await db.books.update_one(
+            {"_id": ObjectId(book_id)},
+            {"$set": update_data}
+        )
+    
+    # Retourner le livre mis √† jour
+    updated_book = await db.books.find_one({"_id": ObjectId(book_id)})
+    return BookResponse(
+        id=str(updated_book["_id"]),
+        title=updated_book["title"],
+        author=updated_book["author"],
+        isbn=updated_book["isbn"],
+        description=updated_book.get("description"),
+        category=updated_book["category"],
+        publication_year=updated_book["publication_year"],
+        publisher=updated_book.get("publisher"),
+        pages=updated_book.get("pages"),
+        language=updated_book["language"],
+        cover_image=updated_book.get("cover_image"),
+        available_copies=updated_book["available_copies"],
+        total_copies=updated_book["total_copies"],
+        created_at=updated_book["created_at"],
+        rating=updated_book.get("rating", 0.0),
+        reviews_count=updated_book.get("reviews_count", 0)
+    )
+
+@router.delete("/{book_id}")
+async def delete_book(
+    book_id: str,
+    current_user: UserResponse = Depends(get_current_admin_user)
+):
+    """Supprimer un livre (admin seulement)"""
+    db = get_database()
+    
+    if not ObjectId.is_valid(book_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid book ID"
+        )
+    
+    # V√©rifier que le livre existe
+    existing_book = await db.books.find_one({"_id": ObjectId(book_id)})
+    if not existing_book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Book not found"
+        )
+    
+    # V√©rifier qu'il n'y a pas d'emprunts actifs
+    active_borrowings = await db.borrowings.find_one({
+        "book_id": book_id,
+        "status": "active"
+    })
+    
+    if active_borrowings:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete book with active borrowings"
+        )
+    
+    # Supprimer le livre
+    await db.books.delete_one({"_id": ObjectId(book_id)})
+    
+    return {"message": "Book deleted successfully"}
+
+@router.get("/categories/list")
+async def get_categories(
+    current_user: UserResponse = Depends(get_current_active_user)
+):
+    """R√©cup√©rer la liste des cat√©gories disponibles"""
+    db = get_database()
+    
+    categories = await db.books.distinct("category")
+    return {"categories": categories}
+
+# Dossier de stockage des images
+IMAGE_DIR = Path("static/images")
+
+# Fonction utilitaire pour servir les images statiques
+@router.get("/image/{image_name}", response_class=FileResponse)
+async def get_book_image(image_name: str):
+    """Servir une image de livre depuis le stockage"""
+    image_path = IMAGE_DIR / image_name
+    if not os.path.exists(image_path):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(image_path)
+
+@router.post("/upload", response_model=BookResponse)
+async def create_book_with_image(
+    title: str = Form(...),
+    author: str = Form(...),
+    isbn: str = Form(...),
+    description: Optional[str] = Form(None),
+    category: str = Form(...),
+    publication_year: int = Form(...),
+    publisher: Optional[str] = Form(None),
+    pages: Optional[int] = Form(None),
+    language: str = Form("Fran√ßais"),
+    total_copies: int = Form(1),
+    cover_image: UploadFile = File(None),
+    current_user: UserResponse = Depends(get_current_admin_user)
+):
+    """Cr√©er un nouveau livre avec upload d'image (admin seulement)"""
+    logger.info(f"Cr√©ation d'un livre avec image: {title} par {author}")
+    
+    db = get_database()
+    
+    # V√©rifier si l'ISBN existe d√©j√†
+    existing_book = await db.books.find_one({"isbn": isbn})
+    if existing_book:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Book with this ISBN already exists"
+        )
+    
+    # Traiter l'image si pr√©sente
+    cover_image_url = None
+    if cover_image and cover_image.filename:
+        # G√©n√©rer un nom de fichier unique pour √©viter les collisions
+        file_extension = os.path.splitext(cover_image.filename)[1]
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        
+        # Cr√©er le chemin complet pour sauvegarder l'image
+        file_path = IMAGE_DIR / unique_filename
+        
+        # S'assurer que le r√©pertoire existe
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Sauvegarder le fichier
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(cover_image.file, buffer)
+        
+        # URL relative pour acc√©der √† l'image
+        cover_image_url = f"/static/images/{unique_filename}"
+        logger.info(f"Image sauvegard√©e √† {file_path}, URL: {cover_image_url}")
+    
+    # Cr√©er le livre
+    book = Book(
+        title=title,
+        author=author,
+        isbn=isbn,
+        description=description,
+        category=category,
+        publication_year=publication_year,
+        publisher=publisher,
+        pages=pages,
+        language=language,
+        cover_image=cover_image_url,  # Utiliser l'URL de l'image ou None
+        total_copies=total_copies,
+        available_copies=total_copies
+    )
+    
+    # Convertir en dict et ins√©rer dans MongoDB
+    try:
+        # Essayer Pydantic v2
+        book_dict = book.model_dump(by_alias=True, exclude_unset=True)
+    except AttributeError:
+        # Fallback pour Pydantic v1
+        book_dict = book.dict(by_alias=True, exclude_unset=True)
+    
+    # Ajouter le champ created_at
+    book_dict["created_at"] = datetime.utcnow()
+    
+    # Ajouter des champs par d√©faut pour les ratings et reviews
+    book_dict["rating"] = 0.0
+    book_dict["reviews_count"] = 0
+    
+    # Ins√©rer dans la base de donn√©es
+    result = await db.books.insert_one(book_dict)
+    
+    # Retourner le livre cr√©√©
+    created_book = await db.books.find_one({"_id": result.inserted_id})
+    return BookResponse(
+        id=str(created_book["_id"]),
+        title=created_book["title"],
+        author=created_book["author"],
+        isbn=created_book["isbn"],
+        description=created_book.get("description"),
+        category=created_book["category"],
+        publication_year=created_book["publication_year"],
+        publisher=created_book.get("publisher"),
+        pages=created_book.get("pages"),
+        language=created_book["language"],
+        cover_image=created_book.get("cover_image"),
+        available_copies=created_book["available_copies"],
+        total_copies=created_book["total_copies"],
+        created_at=created_book["created_at"],
+        rating=created_book.get("rating", 0.0),
+        reviews_count=created_book.get("reviews_count", 0)
+    )@ r o u t e r . p u t ( " / { b o o k _ i d } / u p l o a d " ,   r e s p o n s e _ m o d e l = B o o k R e s p o n s e )  
+ a s y n c   d e f   u p d a t e _ b o o k _ w i t h _ i m a g e (  
+         b o o k _ i d :   s t r ,  
+         t i t l e :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         a u t h o r :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         d e s c r i p t i o n :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         c a t e g o r y :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         p u b l i c a t i o n _ y e a r :   O p t i o n a l [ i n t ]   =   F o r m ( N o n e ) ,  
+         p u b l i s h e r :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         p a g e s :   O p t i o n a l [ i n t ]   =   F o r m ( N o n e ) ,  
+         l a n g u a g e :   O p t i o n a l [ s t r ]   =   F o r m ( N o n e ) ,  
+         t o t a l _ c o p i e s :   O p t i o n a l [ i n t ]   =   F o r m ( N o n e ) ,  
+         c o v e r _ i m a g e :   U p l o a d F i l e   =   F i l e ( N o n e ) ,  
+         c u r r e n t _ u s e r :   U s e r R e s p o n s e   =   D e p e n d s ( g e t _ c u r r e n t _ a d m i n _ u s e r )  
+ ) :  
+         " " " M e t t r e   √ †   j o u r   u n   l i v r e   a v e c   u p l o a d   d ' i m a g e   ( a d m i n   s e u l e m e n t ) " " "  
+         l o g g e r . i n f o ( f " M i s e   √ †   j o u r   d ' u n   l i v r e   a v e c   I D :   { b o o k _ i d } " )  
+          
+         d b   =   g e t _ d a t a b a s e ( )  
+          
+         i f   n o t   O b j e c t I d . i s _ v a l i d ( b o o k _ i d ) :  
+                 r a i s e   H T T P E x c e p t i o n (  
+                         s t a t u s _ c o d e = s t a t u s . H T T P _ 4 0 0 _ B A D _ R E Q U E S T ,  
+                         d e t a i l = " I n v a l i d   b o o k   I D "  
+                 )  
+          
+         #   V √ © r i f i e r   q u e   l e   l i v r e   e x i s t e  
+         e x i s t i n g _ b o o k   =   a w a i t   d b . b o o k s . f i n d _ o n e ( { " _ i d " :   O b j e c t I d ( b o o k _ i d ) } )  
+         i f   n o t   e x i s t i n g _ b o o k :  
+                 r a i s e   H T T P E x c e p t i o n (  
+                         s t a t u s _ c o d e = s t a t u s . H T T P _ 4 0 4 _ N O T _ F O U N D ,  
+                         d e t a i l = " B o o k   n o t   f o u n d "  
+                 )  
+          
+         #   P r √ © p a r e r   l e s   d o n n √ © e s   d e   m i s e   √ †   j o u r  
+         u p d a t e _ d a t a   =   { }  
+          
+         #   A j o u t e r   s e u l e m e n t   l e s   c h a m p s   n o n   n u l s   a u   d i c t   d e   m i s e   √ †   j o u r  
+         i f   t i t l e   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " t i t l e " ]   =   t i t l e  
+         i f   a u t h o r   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " a u t h o r " ]   =   a u t h o r  
+         i f   d e s c r i p t i o n   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " d e s c r i p t i o n " ]   =   d e s c r i p t i o n  
+         i f   c a t e g o r y   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " c a t e g o r y " ]   =   c a t e g o r y  
+         i f   p u b l i c a t i o n _ y e a r   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " p u b l i c a t i o n _ y e a r " ]   =   p u b l i c a t i o n _ y e a r  
+         i f   p u b l i s h e r   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " p u b l i s h e r " ]   =   p u b l i s h e r  
+         i f   p a g e s   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " p a g e s " ]   =   p a g e s  
+         i f   l a n g u a g e   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " l a n g u a g e " ]   =   l a n g u a g e  
+         i f   t o t a l _ c o p i e s   i s   n o t   N o n e :  
+                 u p d a t e _ d a t a [ " t o t a l _ c o p i e s " ]   =   t o t a l _ c o p i e s  
+                 #   R e c a l c u l e r   l e s   c o p i e s   d i s p o n i b l e s   e n   f o n c t i o n   d u   n o u v e l   i n v e n t a i r e  
+                 b o r r o w e d   =   e x i s t i n g _ b o o k [ " t o t a l _ c o p i e s " ]   -   e x i s t i n g _ b o o k [ " a v a i l a b l e _ c o p i e s " ]  
+                 n e w _ a v a i l a b l e   =   m a x ( 0 ,   t o t a l _ c o p i e s   -   b o r r o w e d )  
+                 u p d a t e _ d a t a [ " a v a i l a b l e _ c o p i e s " ]   =   n e w _ a v a i l a b l e  
+          
+         #   T r a i t e r   l ' i m a g e   s i   p r √ © s e n t e  
+         i f   c o v e r _ i m a g e   a n d   c o v e r _ i m a g e . f i l e n a m e :  
+                 #   G √ © n √ © r e r   u n   n o m   d e   f i c h i e r   u n i q u e  
+                 f i l e _ e x t e n s i o n   =   o s . p a t h . s p l i t e x t ( c o v e r _ i m a g e . f i l e n a m e ) [ 1 ]  
+                 u n i q u e _ f i l e n a m e   =   f " { u u i d . u u i d 4 ( ) } { f i l e _ e x t e n s i o n } "  
+                  
+                 #   C h e m i n   c o m p l e t   p o u r   s a u v e g a r d e r   l ' i m a g e  
+                 f i l e _ p a t h   =   I M A G E _ D I R   /   u n i q u e _ f i l e n a m e  
+                  
+                 #   S ' a s s u r e r   q u e   l e   r √ © p e r t o i r e   e x i s t e  
+                 o s . m a k e d i r s ( o s . p a t h . d i r n a m e ( f i l e _ p a t h ) ,   e x i s t _ o k = T r u e )  
+                  
+                 #   S a u v e g a r d e r   l e   f i c h i e r  
+                 w i t h   o p e n ( f i l e _ p a t h ,   " w b " )   a s   b u f f e r :  
+                         s h u t i l . c o p y f i l e o b j ( c o v e r _ i m a g e . f i l e ,   b u f f e r )  
+                  
+                 #   U R L   r e l a t i v e   p o u r   a c c √ © d e r   √ †   l ' i m a g e  
+                 u p d a t e _ d a t a [ " c o v e r _ i m a g e " ]   =   f " / s t a t i c / i m a g e s / { u n i q u e _ f i l e n a m e } "  
+                 l o g g e r . i n f o ( f " N o u v e l l e   i m a g e   s a u v e g a r d √ © e   √ †   { f i l e _ p a t h } ,   U R L :   { u p d a t e _ d a t a [ ' c o v e r _ i m a g e ' ] } " )  
+                  
+                 #   S u p p r i m e r   l ' a n c i e n n e   i m a g e   s i   e l l e   e x i s t e  
+                 o l d _ i m a g e _ u r l   =   e x i s t i n g _ b o o k . g e t ( " c o v e r _ i m a g e " )  
+                 i f   o l d _ i m a g e _ u r l   a n d   o l d _ i m a g e _ u r l . s t a r t s w i t h ( " / s t a t i c / i m a g e s / " ) :  
+                         o l d _ i m a g e _ n a m e   =   o s . p a t h . b a s e n a m e ( o l d _ i m a g e _ u r l )  
+                         o l d _ i m a g e _ p a t h   =   I M A G E _ D I R   /   o l d _ i m a g e _ n a m e  
+                         i f   o s . p a t h . e x i s t s ( o l d _ i m a g e _ p a t h ) :  
+                                 t r y :  
+                                         o s . r e m o v e ( o l d _ i m a g e _ p a t h )  
+                                         l o g g e r . i n f o ( f " A n c i e n n e   i m a g e   s u p p r i m √ © e :   { o l d _ i m a g e _ p a t h } " )  
+                                 e x c e p t   E x c e p t i o n   a s   e :  
+                                         l o g g e r . e r r o r ( f " E r r e u r   l o r s   d e   l a   s u p p r e s s i o n   d e   l ' a n c i e n n e   i m a g e :   { e } " )  
+          
+         #   M e t t r e   √ †   j o u r   l e   l i v r e   s e u l e m e n t   s i   d e s   c h a n g e m e n t s   s o n t   √ †   f a i r e  
+         i f   u p d a t e _ d a t a :  
+                 u p d a t e _ d a t a [ " u p d a t e d _ a t " ]   =   d a t e t i m e . u t c n o w ( )  
+                  
+                 #   M e t t r e   √ †   j o u r   d a n s   l a   b a s e   d e   d o n n √ © e s  
+                 a w a i t   d b . b o o k s . u p d a t e _ o n e (  
+                         { " _ i d " :   O b j e c t I d ( b o o k _ i d ) } ,  
+                         { " $ s e t " :   u p d a t e _ d a t a }  
+                 )  
+          
+         #   R e t o u r n e r   l e   l i v r e   m i s   √ †   j o u r  
+         u p d a t e d _ b o o k   =   a w a i t   d b . b o o k s . f i n d _ o n e ( { " _ i d " :   O b j e c t I d ( b o o k _ i d ) } )  
+         r e t u r n   B o o k R e s p o n s e (  
+                 i d = s t r ( u p d a t e d _ b o o k [ " _ i d " ] ) ,  
+                 t i t l e = u p d a t e d _ b o o k [ " t i t l e " ] ,  
+                 a u t h o r = u p d a t e d _ b o o k [ " a u t h o r " ] ,  
+                 i s b n = u p d a t e d _ b o o k [ " i s b n " ] ,  
+                 d e s c r i p t i o n = u p d a t e d _ b o o k . g e t ( " d e s c r i p t i o n " ) ,  
+                 c a t e g o r y = u p d a t e d _ b o o k [ " c a t e g o r y " ] ,  
+                 p u b l i c a t i o n _ y e a r = u p d a t e d _ b o o k [ " p u b l i c a t i o n _ y e a r " ] ,  
+                 p u b l i s h e r = u p d a t e d _ b o o k . g e t ( " p u b l i s h e r " ) ,  
+                 p a g e s = u p d a t e d _ b o o k . g e t ( " p a g e s " ) ,  
+                 l a n g u a g e = u p d a t e d _ b o o k [ " l a n g u a g e " ] ,  
+                 c o v e r _ i m a g e = u p d a t e d _ b o o k . g e t ( " c o v e r _ i m a g e " ) ,  
+                 a v a i l a b l e _ c o p i e s = u p d a t e d _ b o o k [ " a v a i l a b l e _ c o p i e s " ] ,  
+                 t o t a l _ c o p i e s = u p d a t e d _ b o o k [ " t o t a l _ c o p i e s " ] ,  
+                 c r e a t e d _ a t = u p d a t e d _ b o o k [ " c r e a t e d _ a t " ] ,  
+                 r a t i n g = u p d a t e d _ b o o k . g e t ( " r a t i n g " ,   0 . 0 ) ,  
+                 r e v i e w s _ c o u n t = u p d a t e d _ b o o k . g e t ( " r e v i e w s _ c o u n t " ,   0 )  
+         )  
+ 
