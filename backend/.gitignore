@@ -1,0 +1,11 @@
+# Ignore environment variable files
+.env
+*.env
+*/.env
+
+# Node modules (if any)
+node_modules/
+
+# Python virtual environment
+venv/
+__pycache__/
