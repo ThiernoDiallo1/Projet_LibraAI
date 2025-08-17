@@ -88,8 +88,18 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setIsLoading(true);
       console.log('Tentative d\'inscription avec:', userData);
       
+<<<<<<< HEAD
       toast.success('Inscription réussie! Vous pouvez maintenant vous connecter.');
     } catch (error: any) {
+=======
+      // Appel à l'API backend pour créer le compte
+      const response = await authApi.register(userData);
+      console.log('Utilisateur créé avec succès:', response);
+      
+      toast.success('Inscription réussie! Vous pouvez maintenant vous connecter.');
+    } catch (error: any) {
+      console.error('Erreur d\'inscription:', error);
+>>>>>>> 48a0ca7 (WIP: corrections locales avant synchronisation avec origin/master)
       toast.error(error.response?.data?.detail || 'Erreur lors de l\'inscription');
       throw error;
     } finally {
